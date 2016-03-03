@@ -37,6 +37,65 @@ void git_commit__free(void *_commit)
 	git__free(commit);
 }
 
+static int git_commit__create_buffer_internal(
+	git_buf *out,
+	git_repository *repo,
+	const git_signature *author,
+	const git_signature *committer,
+	const char *message_encoding,
+	const char *message,
+	const git_oid *tree,
+	git_commit_parent_callback parent_cb,
+	void *parent_payload,
+	const git_oid *current_id,
+	bool validate)
+{
+	int matched_parent = 0;
+	size_t i = 0;
+	const git_oid *parent;
+
+	assert(out && repo && tree && parent_cb);
+
+	if (validate && !git_object__is_valid(repo, tree, GIT_OBJ_TREE))
+		return -1;
+
+	git_oid__writebuf(out, "tree ", tree);
+
+	while ((parent = parent_cb(i, parent_payload)) != NULL) {
+		if (validate && !git_object__is_valid(repo, parent, GIT_OBJ_COMMIT)) {
+			goto on_error;
+		}
+
+		git_oid__writebuf(out, "parent ", parent);
+		if (i == 0 && current_id && git_oid_equal(current_id, parent))
+			matched_parent = 1;
+		i++;
+	}
+
+	if (current_id && !matched_parent) {
+		git_buf_free(out);
+		giterr_set(GITERR_OBJECT, "failed to create commit: current tip is not the first parent");
+		return GIT_EMODIFIED;
+	}
+
+	git_signature__writebuf(out, "author ", author);
+	git_signature__writebuf(out, "committer ", committer);
+
+	if (message_encoding != NULL)
+		git_buf_printf(out, "encoding %s\n", message_encoding);
+
+	git_buf_putc(out, '\n');
+
+	if (git_buf_puts(out, message) < 0)
+		goto on_error;
+
+	return 0;
+
+on_error:
+	git_buf_free(out);
+	return -1;
+}
+
 static int git_commit__create_internal(
 	git_oid *id,
 	git_repository *repo,
@@ -50,18 +109,11 @@ static int git_commit__create_internal(
 	void *parent_payload,
 	bool validate)
 {
-	git_reference *ref = NULL;
-	int error = 0, matched_parent = 0;
-	const git_oid *current_id = NULL;
-	git_buf commit = GIT_BUF_INIT;
-	size_t i = 0;
+	int error;
 	git_odb *odb;
-	const git_oid *parent;
-
-	assert(id && repo && tree && parent_cb);
-
-	if (validate && !git_object__is_valid(repo, tree, GIT_OBJ_TREE))
-		return -1;
+	git_reference *ref = NULL;
+	git_buf buf = GIT_BUF_INIT;
+	const git_oid *current_id = NULL;
 
 	if (update_ref) {
 		error = git_reference_lookup_resolved(&ref, repo, update_ref, 10);
@@ -73,45 +125,20 @@ static int git_commit__create_internal(
 	if (ref)
 		current_id = git_reference_target(ref);
 
-	git_oid__writebuf(&commit, "tree ", tree);
 
-	while ((parent = parent_cb(i, parent_payload)) != NULL) {
-		if (validate && !git_object__is_valid(repo, parent, GIT_OBJ_COMMIT)) {
-			error = -1;
-			goto on_error;
-		}
+	error = git_commit__create_buffer_internal(&buf, repo, author, committer,
+						   message_encoding, message, tree,
+						   parent_cb, parent_payload, current_id, validate);
 
-		git_oid__writebuf(&commit, "parent ", parent);
-		if (i == 0 && current_id && git_oid_equal(current_id, parent))
-			matched_parent = 1;
-		i++;
-	}
-
-	if (ref && !matched_parent) {
-		git_reference_free(ref);
-		git_buf_free(&commit);
-		giterr_set(GITERR_OBJECT, "failed to create commit: current tip is not the first parent");
-		return GIT_EMODIFIED;
-	}
-
-	git_signature__writebuf(&commit, "author ", author);
-	git_signature__writebuf(&commit, "committer ", committer);
-
-	if (message_encoding != NULL)
-		git_buf_printf(&commit, "encoding %s\n", message_encoding);
-
-	git_buf_putc(&commit, '\n');
-
-	if (git_buf_puts(&commit, message) < 0)
-		goto on_error;
+	if (error < 0)
+		goto cleanup;
 
 	if (git_repository_odb__weakptr(&odb, repo) < 0)
-		goto on_error;
+		goto cleanup;
 
-	if (git_odb_write(id, odb, commit.ptr, commit.size, GIT_OBJ_COMMIT) < 0)
-		goto on_error;
+	if (git_odb_write(id, odb, buf.ptr, buf.size, GIT_OBJ_COMMIT) < 0)
+		goto cleanup;
 
-	git_buf_free(&commit);
 
 	if (update_ref != NULL) {
 		error = git_reference__update_for_commit(
@@ -120,11 +147,10 @@ static int git_commit__create_internal(
 		return error;
 	}
 
-	return 0;
-
-on_error:
-	git_buf_free(&commit);
-	return -1;
+cleanup:
+	git_reference_free(ref);
+	git_buf_free(&buf);
+	return error;
 }
 
 int git_commit_create_from_callback(
@@ -738,4 +764,24 @@ cleanup:
 	git_buf_clear(signature);
 	git_buf_clear(signed_data);
 	return error;
+}
+
+int git_commit_create_buffer(git_buf *out,
+	git_repository *repo,
+	const git_signature *author,
+	const git_signature *committer,
+	const char *message_encoding,
+	const char *message,
+	const git_tree *tree,
+	size_t parent_count,
+	const git_commit *parents[])
+{
+	commit_parent_data data = { parent_count, parents, repo };
+
+	assert(tree && git_tree_owner(tree) == repo);
+
+	return git_commit__create_buffer_internal(
+		out, repo, author, committer,
+		message_encoding, message, git_tree_id(tree),
+		commit_parent_from_array, &data, NULL, false);
 }
